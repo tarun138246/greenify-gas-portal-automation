@@ -155,6 +155,7 @@ async function runAutomation({ username, password, birthYear, birthMonth, birthD
 
     const context = await browser.newContext();
     const page = await context.newPage();
+    page.setDefaultTimeout(90000);
 
     try {
         // ================= LOGIN =================
