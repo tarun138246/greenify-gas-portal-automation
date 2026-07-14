@@ -12,11 +12,26 @@ const PORT = process.env.PORT || 3000;
 const AUTOMATION_TRIGGER_SECRET = process.env.AUTOMATION_TRIGGER_SECRET;
 const STORE_DATA_BASE_URL = process.env.STORE_DATA_BASE_URL;
 
-/**
- * Timing-safe comparison of the caller's "Authorization: Bearer <secret>"
- * header against AUTOMATION_TRIGGER_SECRET, so this service can't be
- * triggered by anyone who doesn't know the shared secret.
- */
+const AUTOMATION_CONCURRENCY = parseInt(process.env.AUTOMATION_CONCURRENCY || '1', 10);
+let activeRuns = 0;
+const queue = [];
+
+function runNext() {
+    if (activeRuns >= AUTOMATION_CONCURRENCY || queue.length === 0) return;
+    const job = queue.shift();
+    activeRuns++;
+    job().finally(() => {
+        activeRuns--;
+        runNext();
+    });
+}
+
+function enqueueAutomation(job) {
+    queue.push(job);
+    console.log(`Job queued. Position: ${queue.length}, active runs: ${activeRuns}`);
+    runNext();
+}
+
 function isAuthorizedTrigger(req) {
     if (!AUTOMATION_TRIGGER_SECRET) return false;
 
@@ -32,17 +47,24 @@ function isAuthorizedTrigger(req) {
 }
 
 /**
- * POST the scraped, structured gas bills to the backend's store-data endpoint,
- * authenticating as the target user with the per-run JWT the backend handed
- * us in the trigger request (store-data requires a real user token, not a
- * static key).
+ * Post scraped bills (gas and electricity) to the backend's store-data endpoint.
+ * @param {string} storeDataToken - per-run JWT from the trigger request
+ * @param {Array} gasBills - array of parsed gas bill objects
+ * @param {Array} electricityBills - array of parsed electricity bill objects
+ * @param {boolean} maintenance - whether the utility site was under maintenance
  */
-async function postBillsToStoreData(storeDataToken, bills) {
+async function postBillsToStoreData(storeDataToken, gasBills, electricityBills, maintenance = false) {
     if (!STORE_DATA_BASE_URL) {
         throw new Error('STORE_DATA_BASE_URL must be set in the environment');
     }
 
     const url = `${STORE_DATA_BASE_URL.replace(/\/+$/, '')}/api/store-data`;
+
+    const payload = {
+        gasBills,
+        electricityBills,
+        maintenance
+    };
 
     const res = await fetch(url, {
         method: 'POST',
@@ -50,7 +72,7 @@ async function postBillsToStoreData(storeDataToken, bills) {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${storeDataToken}`
         },
-        body: JSON.stringify({ utilityType: 'gas', bills })
+        body: JSON.stringify(payload)
     });
 
     const bodyText = await res.text().catch(() => '');
@@ -58,7 +80,10 @@ async function postBillsToStoreData(storeDataToken, bills) {
         throw new Error(`store-data endpoint responded ${res.status}: ${bodyText}`);
     }
 
-    console.log(`Posted ${bills.length} bill(s) to ${url} (status ${res.status})`);
+    console.log(
+        `Posted to ${url} (status ${res.status}): ` +
+        `maintenance=${maintenance}, gas=${gasBills.length}, electricity=${electricityBills.length}`
+    );
     return bodyText;
 }
 
@@ -81,35 +106,55 @@ app.post('/run-automation', async (req, res) => {
     const jobId = crypto.randomUUID();
     const logLabel = userId ? `${jobId} (user ${userId})` : jobId;
 
-    // Respond immediately; the automation runs in the background since it can take a while.
+    // Respond immediately; the automation runs in the background.
     res.status(202).json({ jobId, status: 'accepted' });
 
-    runAutomation({
-        username,
-        password,
-        birthYear: dob.year,
-        birthMonth: dob.month,
-        birthDay: dob.day,
-        headless: true
-    })
-        .then(async ({ bills, rawText }) => {
-            console.log(`Job ${logLabel} scraped ${bills.length} bill(s).`);
-            console.log(rawText);
-
-            if (bills.length === 0) {
-                console.warn(`Job ${logLabel}: no bills parsed, skipping store-data submission.`);
-                return;
-            }
-
-            try {
-                await postBillsToStoreData(storeDataToken, bills);
-            } catch (err) {
-                console.error(`Job ${logLabel}: failed to submit bills to store-data endpoint:`, err.message);
-            }
+    enqueueAutomation(() =>
+        runAutomation({
+            username,
+            password,
+            birthYear: dob.year,
+            birthMonth: dob.month,
+            birthDay: dob.day,
+            headless: true
         })
-        .catch((err) => {
-            console.error(`Automation failed for job ${logLabel}:`, err);
-        });
+            .then(async (result) => {
+                const { gasBills, electricityBills, maintenance } = result;
+
+                // 1. Maintenance case → notify backend immediately
+                if (maintenance) {
+                    console.log(`Job ${logLabel}: site under maintenance. Notifying backend...`);
+                    try {
+                        await postBillsToStoreData(storeDataToken, [], [], true);
+                    } catch (err) {
+                        console.error(`Job ${logLabel}: failed to notify backend about maintenance:`, err.message);
+                    }
+                    return;
+                }
+
+                // 2. Normal run – log what we got
+                console.log(
+                    `Job ${logLabel} scraped: ` +
+                    `${gasBills.length} gas bill(s), ${electricityBills.length} electricity bill(s).`
+                );
+
+                // 3. If both are empty, skip submission (avoid a call with no data)
+                if (gasBills.length === 0 && electricityBills.length === 0) {
+                    console.warn(`Job ${logLabel}: no bills parsed, skipping store-data submission.`);
+                    return;
+                }
+
+                // 4. Post combined data
+                try {
+                    await postBillsToStoreData(storeDataToken, gasBills, electricityBills);
+                } catch (err) {
+                    console.error(`Job ${logLabel}: failed to submit bills to store-data endpoint:`, err.message);
+                }
+            })
+            .catch((err) => {
+                console.error(`Automation failed for job ${logLabel}:`, err);
+            })
+    );
 });
 
 app.listen(PORT, () => {
